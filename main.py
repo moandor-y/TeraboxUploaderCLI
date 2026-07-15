@@ -750,10 +750,14 @@ def get_files_in_directory(find_dir, base_directory) -> dict:
             if filename in [".DS_Store", os.path.basename(__file__), "settings.json", "secrets.json"]:
                 fmt.warning("upload", f"Skipping file {filename} because it's a protected file.")
                 continue
+            is_ignored = False
             for exclusion in IGNOREFIL:
                 if fnmatch.fnmatch(filename, exclusion):
                     fmt.warning("upload", f"Skipping file {filename} because it's in the ignore list.")
-                    continue
+                    is_ignored = True
+                    break
+            if is_ignored:
+                continue
             sizebytes = os.path.getsize(full_path)
             relpath = os.path.relpath(full_path, base_directory)
             dir_files.setdefault(find_dir, []).append({"name": filename, "relative_path": relpath, "sizebytes":
