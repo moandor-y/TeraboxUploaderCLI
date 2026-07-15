@@ -950,7 +950,7 @@ def _process_single_file_entry(directory, file, remote_files):
     # Move/delete
     if MOVEFILES:
         try:
-            src_move = os.path.abspath(os.path.join(local_source_dir, file['relative_path']))
+            src_move = os.path.abspath(os.path.join(SOURCE_DIR, file['relative_path']))
             dst_move = os.path.abspath(os.path.join(MOVETOLOC, os.path.basename(file['relative_path'])))
             try:
                 display_src_move = _short_path(src_move, prefer_base=SOURCE_DIR)
@@ -973,7 +973,7 @@ def _process_single_file_entry(directory, file, remote_files):
 
     if DELSRCFIL:
         try:
-            src_del = os.path.abspath(os.path.join(local_source_dir, file['relative_path']))
+            src_del = os.path.abspath(os.path.join(SOURCE_DIR, file['relative_path']))
             try:
                 display_src_del = _short_path(src_del, prefer_base=SOURCE_DIR)
             except Exception:
