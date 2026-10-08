@@ -179,6 +179,46 @@ def _format_bytes(size_bytes: float) -> str:
     return f"{val:.2f} {units[idx]}"
 
 
+def _format_bytes_short(size_bytes: float) -> str:
+    if size_bytes <= 0:
+        return "0"
+    units = ("B", "K", "M", "G", "T")
+    idx = 0
+    val = float(size_bytes)
+    while val >= 1024.0 and idx < len(units) - 1:
+        val /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(val)}B"
+    return f"{val:.1f}{units[idx]}"
+
+
+def _parse_curl_size(val_str: str) -> float:
+    s = val_str.strip()
+    if not s:
+        return 0.0
+    mult = 1.0
+    if s[-1] in ("k", "K"):
+        mult = 1024.0
+        s = s[:-1]
+    elif s[-1] in ("m", "M"):
+        mult = 1024.0 ** 2
+        s = s[:-1]
+    elif s[-1] in ("g", "G"):
+        mult = 1024.0 ** 3
+        s = s[:-1]
+    elif s[-1] in ("t", "T"):
+        mult = 1024.0 ** 4
+        s = s[:-1]
+    elif s[-1] in ("p", "P"):
+        mult = 1024.0 ** 5
+        s = s[:-1]
+    try:
+        return float(s) * mult
+    except ValueError:
+        return 0.0
+
+
 def _render_bar(pct: float, width: int = 16) -> str:
     pct = max(0.0, min(100.0, pct))
     filled = int(round((pct / 100.0) * width))
@@ -188,11 +228,19 @@ def _render_bar(pct: float, width: int = 16) -> str:
 class ChunkProgressTracker:
     """Tracks multi-worker chunk upload progress and renders a live multi-line status block."""
 
-    def __init__(self, fmt: Formatting, num_workers: int, total_chunks: int, total_bytes: int):
+    def __init__(
+        self,
+        fmt: Formatting,
+        num_workers: int,
+        total_chunks: int,
+        total_bytes: int,
+        unit_label: str = "chunks",
+    ):
         self.fmt = fmt
         self.num_workers = num_workers
         self.total_chunks = total_chunks
         self.total_bytes = max(1, total_bytes)
+        self.unit_label = unit_label
         self._lock = threading.Lock()
         self._free_slots = list(range(num_workers))
         self._slots = [
@@ -204,36 +252,101 @@ class ChunkProgressTracker:
                 "xferd": "0",
                 "total": "0",
                 "speed": "0",
+                "speed_bps": 0.0,
                 "eta": "",
+                "start_time": 0.0,
+                "last_update": 0.0,
             }
             for _ in range(num_workers)
         ]
         self._completed_chunks = 0
         self._completed_bytes = 0
+        self._completed_time = 0.0
         self._last_render = 0.0
 
     def acquire_slot(self, partseq: int, local_path: str, chunk_size: int) -> int:
         base = os.path.basename(local_path)
-        label = base.split(".")[-1] if ".part" in base else f"part{partseq:03d}"
+        if ".part" in base:
+            label = base.split(".")[-1]
+        else:
+            label = base[-7:] if len(base) > 7 else base
+        now = time.monotonic()
         with self._lock:
             slot = self._free_slots.pop(0) if self._free_slots else (partseq % self.num_workers)
             self._slots[slot] = {
                 "active": True,
+                "base_label": label,
                 "label": label,
                 "pct": 0,
                 "chunk_size": chunk_size,
                 "xferd": "0",
-                "total": _format_bytes(chunk_size).replace(" ", ""),
+                "total": _format_bytes_short(chunk_size),
                 "speed": "0/s",
+                "speed_bps": 0.0,
                 "eta": "--:--",
+                "start_time": now,
+                "last_update": 0.0,
+                "low_speed_since": None,
             }
             self._render_locked(force=True)
             return slot
 
-    def update_from_curl_line(self, slot: int, line: str) -> None:
+    def reset_slot_for_retry(self, slot: int, attempt: int) -> None:
+        now = time.monotonic()
+        with self._lock:
+            st = self._slots[slot]
+            base_label = st.get("base_label", st["label"])
+            if base_label.startswith("part") and len(base_label) == 7:
+                retry_label = f"p{base_label[4:]}#{attempt}"
+            else:
+                retry_label = f"{base_label[:5]}#{attempt}"
+            st["label"] = retry_label
+            st["pct"] = 0
+            st["xferd"] = "0"
+            st["speed"] = "0/s"
+            st["speed_bps"] = 0.0
+            st["eta"] = "--:--"
+            st["start_time"] = now
+            st["last_update"] = 0.0
+            st["low_speed_since"] = None
+            self._render_locked(force=True)
+
+    def get_slot_status(self, slot: int) -> tuple:
+        with self._lock:
+            st = self._slots[slot]
+            return st.get("speed", "0/s"), st.get("eta", "--:--"), st.get("pct", 0)
+
+    def update_from_bytes(self, slot: int, processed_bytes: int, total_bytes: int) -> None:
+        now = time.monotonic()
+        st = self._slots[slot]
+        if processed_bytes < total_bytes and (now - st.get("last_update", 0.0)) < 0.05:
+            return
+        total = max(1, total_bytes)
+        pct = int((processed_bytes / total) * 100)
+        elapsed = max(0.001, now - st.get("start_time", now))
+        speed_bps = processed_bytes / elapsed
+        rem_bytes = max(0, total - processed_bytes)
+        if speed_bps > 0 and rem_bytes > 0:
+            eta_sec = int(rem_bytes / speed_bps)
+            eta_str = f"{eta_sec // 60:02d}:{eta_sec % 60:02d}"
+        elif rem_bytes == 0:
+            eta_str = "00:00"
+        else:
+            eta_str = "--:--"
+        with self._lock:
+            st = self._slots[slot]
+            st["last_update"] = now
+            st["pct"] = max(0, min(100, pct))
+            st["xferd"] = _format_bytes_short(processed_bytes)
+            st["total"] = _format_bytes_short(total)
+            st["speed"] = f"{_format_bytes_short(speed_bps)}/s"
+            st["eta"] = eta_str
+            self._render_locked(force=False)
+
+    def update_from_curl_line(self, slot: int, line: str) -> bool:
         tokens = line.strip().split()
         if len(tokens) < 9 or not tokens[0].isdigit():
-            return
+            return False
         pct = int(tokens[4]) if tokens[4].isdigit() else int(tokens[0])
         total_str = tokens[1]
         xferd_str = tokens[5]
@@ -241,6 +354,11 @@ class ChunkProgressTracker:
         avg_up = tokens[7]
         speed_str = cur_spd if cur_spd != "0" else avg_up
         eta_str = tokens[10] if len(tokens) >= 12 else (tokens[9] if len(tokens) == 11 else "--:--")
+        cur_spd_bps = _parse_curl_size(cur_spd)
+        avg_up_bps = _parse_curl_size(avg_up)
+        speed_bps = cur_spd_bps if cur_spd_bps > 0 else avg_up_bps
+        now = time.monotonic()
+        should_abort_slow = False
         with self._lock:
             st = self._slots[slot]
             st["pct"] = max(0, min(100, pct))
@@ -248,15 +366,52 @@ class ChunkProgressTracker:
                 st["total"] = total_str
             st["xferd"] = xferd_str
             st["speed"] = f"{speed_str}/s"
+            st["speed_bps"] = speed_bps
             st["eta"] = eta_str
+
+            completed_speed = (
+                (self._completed_bytes / self._completed_time)
+                if (self._completed_chunks > 0 and self._completed_time > 0)
+                else 0.0
+            )
+            active_speeds = sorted(
+                s.get("speed_bps", 0.0)
+                for s in self._slots
+                if s["active"] and s.get("speed_bps", 0.0) > 0
+            )
+            if len(active_speeds) >= 2:
+                upper_half = active_speeds[len(active_speeds) // 2 :]
+                peer_speed = sum(upper_half) / len(upper_half)
+            else:
+                peer_speed = 0.0
+
+            ref_speed_bps = max(completed_speed, peer_speed)
+            min_speed_bps = ref_speed_bps * 0.25
+
+            elapsed = now - st.get("start_time", now)
+            if ref_speed_bps > 0 and elapsed >= 5.0 and speed_bps < min_speed_bps:
+                if st.get("low_speed_since") is None:
+                    st["low_speed_since"] = now
+                low_duration = now - st["low_speed_since"]
+                rem_bytes = max(0.0, st["chunk_size"] * (1.0 - st["pct"] / 100.0))
+                rem_eta_sec = rem_bytes / max(1.0, speed_bps)
+                fresh_eta_sec = st["chunk_size"] / ref_speed_bps
+                if low_duration >= 6.0 and rem_eta_sec > 1.5 * fresh_eta_sec:
+                    should_abort_slow = True
+            elif ref_speed_bps > 0 and speed_bps >= min_speed_bps:
+                st["low_speed_since"] = None
+
             self._render_locked(force=False)
+        return should_abort_slow
 
     def release_slot(self, slot: int, success: bool) -> None:
+        now = time.monotonic()
         with self._lock:
             st = self._slots[slot]
             if success:
                 self._completed_chunks += 1
                 self._completed_bytes += st["chunk_size"]
+                self._completed_time += max(0.1, now - st.get("start_time", now))
             self._slots[slot] = {
                 "active": False,
                 "label": "idle",
@@ -265,6 +420,7 @@ class ChunkProgressTracker:
                 "xferd": "0",
                 "total": "0",
                 "speed": "0",
+                "speed_bps": 0.0,
                 "eta": "",
             }
             if slot not in self._free_slots:
@@ -301,7 +457,7 @@ class ChunkProgressTracker:
         overall_bar = _render_bar(overall_pct, width=16)
         lines.append(
             f"  {Style.BRIGHT}{Fore.YELLOW}[All]{Style.RESET_ALL} "
-            f"{self._completed_chunks}/{self.total_chunks} chunks "
+            f"{self._completed_chunks}/{self.total_chunks} {self.unit_label} "
             f"[{Fore.YELLOW}{overall_bar}{Style.RESET_ALL}] {overall_pct:5.1f}% "
             f"({_format_bytes(current_bytes)} / {_format_bytes(self.total_bytes)})"
         )

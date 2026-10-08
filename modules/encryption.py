@@ -81,7 +81,7 @@ class Encryption:
     """
 
     def __init__(self):
-        self.chunk_size = 64 * 1024
+        self.chunk_size = 1024 * 1024
 
     @staticmethod
     def generate_key(keyfile='keyfile.key', password=None, key_size=32) -> bool:
@@ -136,11 +136,12 @@ class Encryption:
             return "AES"
         return "Fernet"
 
-    def encrypt_file(self, keypath: str, filepath: str) -> bool:
+    def encrypt_file(self, keypath: str, filepath: str, progress_callback=None) -> bool:
         """
         Encrypts a file using the keyfile
         :param keypath:  path to the keyfile
         :param filepath:  name of the file to encrypt
+        :param progress_callback: optional callable(processed_bytes, total_bytes)
         :return:
         """
 
@@ -152,25 +153,22 @@ class Encryption:
             raise FileNotFoundError(f"File {filepath} does not exist.")
 
         # VERIFY IF FILE IS ALREADY ENCRYPTED
-        if "enc" in filepath:
-            original = Path(filepath).read_bytes()
-            Path(os.path.join("./temp", f"{os.path.basename(filepath)}.enc")).write_bytes(original)
+        if filepath.endswith(".enc"):
             raise FileEncryptedException(f"File {filepath} is already encrypted. Reusing file.")
 
-        if Path(filepath).read_bytes().startswith(b"ENC-TERABOXUPLOADERCLI"):
-            original = Path(filepath).read_bytes()
-            Path(os.path.join("./temp", f"{os.path.basename(filepath)}.enc")).write_bytes(original)
-            raise FileEncryptedException(f"File {filepath} is already encrypted with Fernet encryption.")
+        with open(filepath, "rb") as f:
+            header = f.read(64)
 
-        if Path(filepath).read_bytes().startswith(b"ENC-TERABOXUPLOADERCLI-AES"):
-            original = Path(filepath).read_bytes()
-            Path(os.path.join("./temp", f"{os.path.basename(filepath)}.enc")).write_bytes(original)
+        if header.startswith(b"ENC-TERABOXUPLOADERCLI-AES"):
             raise FileEncryptedException(f"File {filepath} is already encrypted with AES encryption.")
 
-        if len(base64.urlsafe_b64decode(Path(keypath).read_bytes())) == 32:
-            return self.encrypt_file_aes(keypath, filepath)
+        if header.startswith(b"ENC-TERABOXUPLOADERCLI"):
+            raise FileEncryptedException(f"File {filepath} is already encrypted with Fernet encryption.")
 
-        return self.encrypt_file_fernet(keypath, filepath)
+        if len(base64.urlsafe_b64decode(Path(keypath).read_bytes())) == 32:
+            return self.encrypt_file_aes(keypath, filepath, progress_callback=progress_callback)
+
+        return self.encrypt_file_fernet(keypath, filepath, progress_callback=progress_callback)
 
     def decrypt_file(self, keypath: str, filename: str) -> bool:
         """
@@ -190,7 +188,10 @@ class Encryption:
         if not filename.endswith(".enc"):
             raise FileNotEncryptedException(f"File {filename} is not encrypted.")
 
-        if (not Path(filename).read_bytes().startswith(b"ENC-TERABOXUPLOADERCLI") and not Path(filename).read_bytes().
+        with open(filename, "rb") as f:
+            header = f.read(64)
+
+        if (not header.startswith(b"ENC-TERABOXUPLOADERCLI") and not header.
                 startswith(b"ENC-TERABOXUPLOADERCLI-AES")):
             raise FileNotEncryptedException(f"File {filename} is not encrypted with Fernet or AES encryption by "
                                             f"TeraboxUploaderCLI.")
@@ -200,11 +201,12 @@ class Encryption:
 
         return self.decrypt_file_fernet(keypath, filename)
 
-    def encrypt_file_aes(self, keypath: str, filepath: str) -> bool:
+    def encrypt_file_aes(self, keypath: str, filepath: str, progress_callback=None) -> bool:
         """
         Encrypts a file using an AES key
         :param keypath:  path to the keyfile
         :param filepath: path to the file to encrypt
+        :param progress_callback: optional callable(processed_bytes, total_bytes)
         :return:
         """
 
@@ -221,6 +223,8 @@ class Encryption:
             raise EncryptFileException(f"Something went wrong when loading keyfile: {e}") from e
 
         destination = os.path.join("./temp", f"{os.path.basename(filepath)}.enc")
+        total_size = os.path.getsize(filepath)
+        processed = 0
 
         # OPEN FILE, ENCRYPT AND SAVE
         try:
@@ -242,17 +246,21 @@ class Encryption:
                     padded_chunk = padder.update(chunk)
                     encrypted_chunk = encryptor.update(padded_chunk)
                     outfile.write(encrypted_chunk)
+                    processed += len(chunk)
+                    if progress_callback is not None:
+                        progress_callback(processed, total_size)
 
         except Exception as e:
             raise EncryptFileException(f"Something went wrong when encrypting file: {e}") from e
 
         return True
 
-    def encrypt_file_fernet(self, keypath: str, filepath: str) -> bool:
+    def encrypt_file_fernet(self, keypath: str, filepath: str, progress_callback=None) -> bool:
         """
         Encrypts a file using a Fernet key
         :param keypath:  path to the keyfile
         :param filepath: path to the file to encrypt
+        :param progress_callback: optional callable(processed_bytes, total_bytes)
         :return:
         """
 
@@ -262,6 +270,7 @@ class Encryption:
             raise EncryptFileException(f"Something went wrong when loading keyfile: {e}") from e
 
         destination = os.path.join("./temp", f"{os.path.basename(filepath)}.enc")
+        total_size = os.path.getsize(filepath)
 
         # OPEN FILE, ENCRYPT AND SAVE
         try:
@@ -270,7 +279,10 @@ class Encryption:
 
                 key = base64.urlsafe_b64encode(key)
                 fernet = Fernet(key)
-                outfile.write(fernet.encrypt(infile.read()))
+                data = infile.read()
+                outfile.write(fernet.encrypt(data))
+                if progress_callback is not None:
+                    progress_callback(len(data), total_size)
 
         except Exception as e:
             raise EncryptFileException(f"Something went wrong when encrypting file: {e}") from e

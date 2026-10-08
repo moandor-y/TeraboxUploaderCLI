@@ -667,11 +667,30 @@ def upload_file(
     """
     slot = None
     slot_released = False
+    max_error_attempts = 5
+    error_attempts = 0
+    attempt = 0
     try:
+        try:
+            display_local = _short_path(local_path, prefer_base=SOURCE_DIR)
+        except Exception:
+            display_local = os.path.basename(local_path)
+
         if tracker is not None:
             slot = tracker.acquire_slot(partseq, local_path, os.path.getsize(local_path))
 
-        base_command = ["curl", "-X", "POST",
+        while True:
+            attempt += 1
+            base_command = [
+                "curl",
+                "-X",
+                "POST",
+                "--connect-timeout",
+                "15",
+                "--speed-limit",
+                "1",
+                "--speed-time",
+                "30",
                 "-H", f"User-Agent:{USERAGENT}",
                 "-H", f"Origin:{BASEURLTB}",
                 "-H", f"Referer:{BASEURLTB}/main?category=all",
@@ -680,73 +699,127 @@ def upload_file(
                 "-F", f"file=@{local_path}",
                 f"{BASEURLTB.replace('www', 'c-jp')}:443/rest/2.0/pcs/superfile2?"
                 f"method=upload&type=tmpfile&app_id=250528&path={quote_plus(REMOTELOC + '/' + cloud_filename)}&"
-                f"uploadid={uploadid_local}&partseq={partseq}"]
-        if os.name == "nt":
-            base_command[0] = os.path.join("curl", "bin", "curl.exe")
+                f"uploadid={uploadid_local}&partseq={partseq}",
+            ]
+            if os.name == "nt":
+                base_command[0] = os.path.join("curl", "bin", "curl.exe")
 
-        if tracker is not None and slot is not None:
-            proc = subprocess.Popen(
-                base_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            buf = b""
-            if proc.stderr is not None:
-                fd = proc.stderr.fileno()
-                while True:
-                    chunk = os.read(fd, 512)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    while b"\r" in buf or b"\n" in buf:
-                        sep_r = buf.find(b"\r")
-                        sep_n = buf.find(b"\n")
-                        if sep_r == -1:
-                            sep = sep_n
-                        elif sep_n == -1:
-                            sep = sep_r
-                        else:
-                            sep = min(sep_r, sep_n)
-                        raw_line = buf[:sep]
-                        buf = buf[sep + 1:]
-                        if raw_line:
-                            tracker.update_from_curl_line(
-                                slot, raw_line.decode("utf-8", errors="replace")
-                            )
-                if buf:
-                    tracker.update_from_curl_line(slot, buf.decode("utf-8", errors="replace"))
-            stdout_bytes = proc.stdout.read() if proc.stdout is not None else b""
-            retcode = proc.wait()
-            if retcode != 0:
-                raise subprocess.CalledProcessError(retcode, base_command, output=stdout_bytes)
-            uresp = json.loads(stdout_bytes.decode("utf-8"))
-        else:
-            out = subprocess.run(base_command, stdout=subprocess.PIPE, check=True)
-            uresp = json.loads(out.stdout.decode('utf-8'))
-
-        if 'error_code' not in uresp:
-            matched = uresp.get("md5") == md5hash
-            if tracker is not None and slot is not None:
-                tracker.release_slot(slot, success=matched)
-                slot_released = True
-            # show a shorter, repo-relative path for readability
             try:
-                display_local = _short_path(local_path, prefer_base=SOURCE_DIR)
-            except Exception:
-                display_local = os.path.basename(local_path)
-            fmt.success("upload", f"File {display_local} uploaded successfully to cloud path {REMOTELOC}/{cloud_filename}.")
-            if matched:
-                fmt.info("md5", f"MD5 hash match for cloud file {cloud_filename} after upload.")
-                return uresp["md5"]
-            fmt.error("md5", f"MD5 hash mismatch for cloud file {cloud_filename} after upload. Skipping file...")
-            return "mismatch"
+                if tracker is not None and slot is not None:
+                    proc = subprocess.Popen(
+                        base_command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    aborted_slow = False
+                    buf = b""
+                    if proc.stderr is not None:
+                        fd = proc.stderr.fileno()
+                        while True:
+                            chunk = os.read(fd, 512)
+                            if not chunk:
+                                break
+                            buf += chunk
+                            while b"\r" in buf or b"\n" in buf:
+                                sep_r = buf.find(b"\r")
+                                sep_n = buf.find(b"\n")
+                                if sep_r == -1:
+                                    sep = sep_n
+                                elif sep_n == -1:
+                                    sep = sep_r
+                                else:
+                                    sep = min(sep_r, sep_n)
+                                raw_line = buf[:sep]
+                                buf = buf[sep + 1:]
+                                if raw_line:
+                                    should_abort = tracker.update_from_curl_line(
+                                        slot, raw_line.decode("utf-8", errors="replace")
+                                    )
+                                    if should_abort:
+                                        aborted_slow = True
+                                        proc.terminate()
+                                        break
+                            if aborted_slow:
+                                break
+                        if buf and not aborted_slow:
+                            tracker.update_from_curl_line(
+                                slot, buf.decode("utf-8", errors="replace")
+                            )
+                    stdout_bytes = proc.stdout.read() if proc.stdout is not None else b""
+                    retcode = proc.wait()
+                    if aborted_slow:
+                        spd_str, eta_str, pct_val = tracker.get_slot_status(slot)
+                        fmt.warning(
+                            "upload",
+                            f"Chunk {display_local} is slow ({spd_str} at {pct_val}%, ETA {eta_str}). "
+                            f"Reconnecting (attempt {attempt + 1})...",
+                        )
+                        tracker.reset_slot_for_retry(slot, attempt + 1)
+                        continue
+                    if retcode != 0:
+                        raise subprocess.CalledProcessError(
+                            retcode, base_command, output=stdout_bytes
+                        )
+                    uresp = json.loads(stdout_bytes.decode("utf-8"))
+                else:
+                    out = subprocess.run(base_command, stdout=subprocess.PIPE, check=True)
+                    uresp = json.loads(out.stdout.decode("utf-8"))
+            except Exception as attempt_exc:
+                error_attempts += 1
+                if error_attempts < max_error_attempts:
+                    fmt.warning(
+                        "upload",
+                        f"Upload error ({error_attempts}/{max_error_attempts}) for {display_local}: {attempt_exc}. Retrying...",
+                    )
+                    if tracker is not None and slot is not None:
+                        tracker.reset_slot_for_retry(slot, attempt + 1)
+                    continue
+                raise
 
-        if tracker is not None and slot is not None:
-            tracker.release_slot(slot, success=False)
-            slot_released = True
-        fmt.error("upload", "File upload failed.")
-        fmt.error("upload", f"ERROR: More information: {uresp}")
-        return "failed"
+            if "error_code" not in uresp:
+                matched = uresp.get("md5") == md5hash
+                if not matched:
+                    error_attempts += 1
+                    if error_attempts < max_error_attempts:
+                        fmt.warning(
+                            "md5",
+                            f"MD5 mismatch ({error_attempts}/{max_error_attempts}) for {display_local}. Retrying...",
+                        )
+                        if tracker is not None and slot is not None:
+                            tracker.reset_slot_for_retry(slot, attempt + 1)
+                        continue
+                if tracker is not None and slot is not None:
+                    tracker.release_slot(slot, success=matched)
+                    slot_released = True
+                fmt.success(
+                    "upload",
+                    f"File {display_local} uploaded successfully to cloud path {REMOTELOC}/{cloud_filename}.",
+                )
+                if matched:
+                    fmt.info("md5", f"MD5 hash match for cloud file {cloud_filename} after upload.")
+                    return uresp["md5"]
+                fmt.error(
+                    "md5",
+                    f"MD5 hash mismatch for cloud file {cloud_filename} after upload. Skipping file...",
+                )
+                return "mismatch"
+
+            error_attempts += 1
+            if error_attempts < max_error_attempts:
+                fmt.warning(
+                    "upload",
+                    f"Server returned error ({error_attempts}/{max_error_attempts}) for {display_local}: {uresp}. Retrying...",
+                )
+                if tracker is not None and slot is not None:
+                    tracker.reset_slot_for_retry(slot, attempt + 1)
+                continue
+
+            if tracker is not None and slot is not None:
+                tracker.release_slot(slot, success=False)
+                slot_released = True
+            fmt.error("upload", "File upload failed.")
+            fmt.error("upload", f"ERROR: More information: {uresp}")
+            return "failed"
     except Exception as exp_upload:
         if tracker is not None and slot is not None and not slot_released:
             tracker.release_slot(slot, success=False)
@@ -871,29 +944,69 @@ if ENCRYPTFL:
         ERRORS = True
         sys.exit()
 
-    fmt.info("encrypt", f"Encrypting files in {SOURCE_DIR}...")
-    for directory, files_in_directory in files.items():
-        for file in files_in_directory:
+    all_files = [
+        (directory, file)
+        for directory, files_in_directory in files.items()
+        for file in files_in_directory
+    ]
+    if all_files:
+        enc_workers = min(MAXWORKERS, len(all_files))
+        total_enc_bytes = sum(f["sizebytes"] for _, f in all_files)
+        fmt.info(
+            "encrypt",
+            f"Encrypting {len(all_files)} files in {SOURCE_DIR} using {enc_workers} parallel workers...",
+        )
+        enc_tracker = ChunkProgressTracker(
+            fmt, enc_workers, len(all_files), total_enc_bytes, unit_label="files"
+        )
+
+        def _encrypt_single_file(idx: int, directory: str, file: dict) -> None:
+            global ERRORS
+            src_path = os.path.join(
+                str(directory), str(file["name"].replace(str(directory), ""))
+            )
+            slot = enc_tracker.acquire_slot(idx, src_path, file["sizebytes"])
+            slot_released = False
             fmt.info("encrypt", f"Encrypting file {file['name']}...")
             try:
-                encrypt.encrypt_file(ENCRYPKEY, os.path.join(str(directory),
-                                                             str(file['name'].replace(str(directory), ''))))
-                file['name'] = f"{file['name']}.enc"
-                file['sizebytes'] = os.path.getsize(os.path.join(TEMP_DIR, file['name']))
-                file['encrypted'] = True
+                encrypt.encrypt_file(
+                    ENCRYPKEY,
+                    src_path,
+                    progress_callback=lambda done, total: enc_tracker.update_from_bytes(
+                        slot, done, total
+                    ),
+                )
+                file["name"] = f"{file['name']}.enc"
+                file["sizebytes"] = os.path.getsize(os.path.join(TEMP_DIR, file["name"]))
+                file["encrypted"] = True
+                enc_tracker.release_slot(slot, success=True)
+                slot_released = True
                 fmt.success("encrypt", f"File {file['name']} encrypted successfully.")
             except FileEncryptedException:
-                file['name'] = f"{file['name']}.enc"
-                file['sizebytes'] = os.path.getsize(os.path.join(TEMP_DIR, file['name']))
-                file['encrypted'] = True
+                enc_tracker.release_slot(slot, success=True)
+                slot_released = True
                 fmt.warning("encrypt", f"File {file['name']} is already encrypted.")
-                continue
             except Exception as e:
+                enc_tracker.release_slot(slot, success=False)
+                slot_released = True
                 fmt.error("encrypt", f"File {file['name']} encryption failed.")
                 fmt.error("encrypt", f"More information about this error: {e}")
-                file['encrypterror'] = True
+                file["encrypterror"] = True
                 ERRORS = True
-                continue
+            finally:
+                if not slot_released:
+                    enc_tracker.release_slot(slot, success=False)
+
+        try:
+            with ThreadPoolExecutor(max_workers=enc_workers) as executor:
+                futures = [
+                    executor.submit(_encrypt_single_file, idx, directory, file)
+                    for idx, (directory, file) in enumerate(all_files)
+                ]
+                for future in as_completed(futures):
+                    future.result()
+        finally:
+            enc_tracker.close()
 
 def _process_single_file_entry(directory, file, remote_files):
     global ERRORS
