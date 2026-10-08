@@ -21,7 +21,14 @@ import sys
 import threading
 import time
 
-from colorama import Fore, Back, Style
+try:
+    from colorama import Fore, Back, Style
+except ImportError:
+    class _AnsiFallback:
+        def __getattr__(self, _name: str) -> str:
+            return ""
+
+    Fore = Back = Style = _AnsiFallback()
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -285,6 +292,10 @@ class ChunkProgressTracker:
                 "speed_bps": 0.0,
                 "eta": "--:--",
                 "start_time": now,
+                "chunk_start_time": now,
+                "prior_elapsed": 0.0,
+                "attempt_elapsed": 0.0,
+                "attempt": 1,
                 "last_update": 0.0,
                 "low_speed_since": None,
             }
@@ -295,6 +306,13 @@ class ChunkProgressTracker:
         now = time.monotonic()
         with self._lock:
             st = self._slots[slot]
+            attempt_elapsed = max(
+                st.get("attempt_elapsed", 0.0),
+                max(0.0, now - st.get("start_time", now)),
+            )
+            st["prior_elapsed"] = st.get("prior_elapsed", 0.0) + attempt_elapsed
+            st["attempt_elapsed"] = 0.0
+            st["attempt"] = attempt
             base_label = st.get("base_label", st["label"])
             if base_label.startswith("part") and len(base_label) == 7:
                 retry_label = f"p{base_label[4:]}#{attempt}"
@@ -352,15 +370,29 @@ class ChunkProgressTracker:
         xferd_str = tokens[5]
         cur_spd = tokens[-1]
         avg_up = tokens[7]
-        speed_str = cur_spd if cur_spd != "0" else avg_up
         eta_str = tokens[10] if len(tokens) >= 12 else (tokens[9] if len(tokens) == 11 else "--:--")
         cur_spd_bps = _parse_curl_size(cur_spd)
         avg_up_bps = _parse_curl_size(avg_up)
-        speed_bps = cur_spd_bps if cur_spd_bps > 0 else avg_up_bps
         now = time.monotonic()
         should_abort_slow = False
         with self._lock:
             st = self._slots[slot]
+            elapsed = max(0.0, now - st.get("start_time", now))
+            st["attempt_elapsed"] = elapsed
+            total_elapsed = max(
+                now - st.get("chunk_start_time", st.get("start_time", now)),
+                st.get("prior_elapsed", 0.0) + elapsed,
+            )
+            prior_elapsed = max(st.get("prior_elapsed", 0.0), total_elapsed - elapsed)
+            if cur_spd_bps > 0:
+                speed_bps = cur_spd_bps
+                speed_str = cur_spd
+            elif elapsed < 5.0:
+                speed_bps = avg_up_bps
+                speed_str = avg_up
+            else:
+                speed_bps = 0.0
+                speed_str = "0"
             st["pct"] = max(0, min(100, pct))
             if total_str != "0":
                 st["total"] = total_str
@@ -379,16 +411,15 @@ class ChunkProgressTracker:
                 for s in self._slots
                 if s["active"] and s.get("speed_bps", 0.0) > 0
             )
-            if len(active_speeds) >= 2:
+            if active_speeds:
                 upper_half = active_speeds[len(active_speeds) // 2 :]
                 peer_speed = sum(upper_half) / len(upper_half)
             else:
                 peer_speed = 0.0
 
-            ref_speed_bps = max(completed_speed, peer_speed)
+            ref_speed_bps = max(completed_speed, peer_speed, avg_up_bps)
             min_speed_bps = ref_speed_bps * 0.25
 
-            elapsed = now - st.get("start_time", now)
             if ref_speed_bps > 0 and elapsed >= 5.0 and speed_bps < min_speed_bps:
                 if st.get("low_speed_since") is None:
                     st["low_speed_since"] = now
@@ -396,7 +427,12 @@ class ChunkProgressTracker:
                 rem_bytes = max(0.0, st["chunk_size"] * (1.0 - st["pct"] / 100.0))
                 rem_eta_sec = rem_bytes / max(1.0, speed_bps)
                 fresh_eta_sec = st["chunk_size"] / ref_speed_bps
-                if low_duration >= 6.0 and rem_eta_sec > 1.5 * fresh_eta_sec:
+                retry_eta_sec = 1.5 * fresh_eta_sec + prior_elapsed
+                if (
+                    low_duration >= 6.0
+                    and rem_eta_sec > retry_eta_sec
+                    and rem_eta_sec > total_elapsed
+                ):
                     should_abort_slow = True
             elif ref_speed_bps > 0 and speed_bps >= min_speed_bps:
                 st["low_speed_since"] = None

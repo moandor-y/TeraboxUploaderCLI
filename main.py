@@ -712,41 +712,82 @@ def upload_file(
                         stderr=subprocess.PIPE,
                     )
                     aborted_slow = False
+                    proc_waited = False
+                    stdout_bytes = b""
+                    retcode = 0
                     buf = b""
-                    if proc.stderr is not None:
-                        fd = proc.stderr.fileno()
-                        while True:
-                            chunk = os.read(fd, 512)
-                            if not chunk:
-                                break
-                            buf += chunk
-                            while b"\r" in buf or b"\n" in buf:
-                                sep_r = buf.find(b"\r")
-                                sep_n = buf.find(b"\n")
-                                if sep_r == -1:
-                                    sep = sep_n
-                                elif sep_n == -1:
-                                    sep = sep_r
-                                else:
-                                    sep = min(sep_r, sep_n)
-                                raw_line = buf[:sep]
-                                buf = buf[sep + 1:]
-                                if raw_line:
-                                    should_abort = tracker.update_from_curl_line(
-                                        slot, raw_line.decode("utf-8", errors="replace")
-                                    )
-                                    if should_abort:
-                                        aborted_slow = True
-                                        proc.terminate()
-                                        break
-                            if aborted_slow:
-                                break
-                        if buf and not aborted_slow:
-                            tracker.update_from_curl_line(
-                                slot, buf.decode("utf-8", errors="replace")
-                            )
-                    stdout_bytes = proc.stdout.read() if proc.stdout is not None else b""
-                    retcode = proc.wait()
+                    try:
+                        if proc.stderr is not None:
+                            fd = proc.stderr.fileno()
+                            while True:
+                                chunk = os.read(fd, 512)
+                                if not chunk:
+                                    break
+                                buf += chunk
+                                while b"\r" in buf or b"\n" in buf:
+                                    sep_r = buf.find(b"\r")
+                                    sep_n = buf.find(b"\n")
+                                    if sep_r == -1:
+                                        sep = sep_n
+                                    elif sep_n == -1:
+                                        sep = sep_r
+                                    else:
+                                        sep = min(sep_r, sep_n)
+                                    raw_line = buf[:sep]
+                                    buf = buf[sep + 1:]
+                                    if raw_line:
+                                        should_abort = tracker.update_from_curl_line(
+                                            slot, raw_line.decode("utf-8", errors="replace")
+                                        )
+                                        if should_abort:
+                                            aborted_slow = True
+                                            break
+                                if aborted_slow:
+                                    break
+                            if buf and not aborted_slow:
+                                if tracker.update_from_curl_line(
+                                    slot, buf.decode("utf-8", errors="replace")
+                                ):
+                                    aborted_slow = True
+                        if not aborted_slow:
+                            stdout_bytes = proc.stdout.read() if proc.stdout is not None else b""
+                            retcode = proc.wait()
+                            proc_waited = True
+                    finally:
+                        try:
+                            if not proc_waited:
+                                try:
+                                    proc.terminate()
+                                except Exception:
+                                    pass
+                                _timeout_exc = getattr(subprocess, "TimeoutExpired", Exception)
+                                if not (
+                                    isinstance(_timeout_exc, type)
+                                    and issubclass(_timeout_exc, BaseException)
+                                ):
+                                    _timeout_exc = Exception
+                                try:
+                                    proc.wait(timeout=5)
+                                except (_timeout_exc, Exception):
+                                    try:
+                                        proc.kill()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        proc.wait()
+                                    except Exception:
+                                        pass
+                        finally:
+                            if proc.stdout is not None:
+                                try:
+                                    proc.stdout.close()
+                                except Exception:
+                                    pass
+                            if proc.stderr is not None:
+                                try:
+                                    proc.stderr.close()
+                                except Exception:
+                                    pass
                     if aborted_slow:
                         spd_str, eta_str, pct_val = tracker.get_slot_status(slot)
                         fmt.warning(
