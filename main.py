@@ -12,6 +12,7 @@ For more information, please visit https://github.com/dnigamer/TeraboxUploaderCL
 If you find any bugs, please open an issue in the GitHub repository mentioned in the link above.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fnmatch
 import math
 import os
@@ -26,7 +27,7 @@ from typing import Optional
 import base64
 
 from modules.encryption import Encryption, FileEncryptedException
-from modules.formatting import Formatting
+from modules.formatting import ChunkProgressTracker, Formatting
 
 CODE_VERSION = "1.8.1"
 fmt = Formatting(timestamps=True)
@@ -166,6 +167,17 @@ if len(sys.argv) > 1 and sys.argv[1] == "setup":
         else:
             DELETE_SOURCE = "false"
 
+        print("Enter the maximum number of parallel chunk upload workers (default: 4):")
+        MAX_WORKERS_INPUT = input(": ").strip()
+        if not MAX_WORKERS_INPUT:
+            MAX_WORKERS = 4
+        else:
+            try:
+                MAX_WORKERS = max(1, int(MAX_WORKERS_INPUT))
+            except ValueError:
+                fmt.error("setup", "Invalid maxworkers setting. Defaulting to 4.")
+                MAX_WORKERS = 4
+
         print("Do you want to enable file encryption? (yes/no)")
         ENCRYPTION_ENAB = input(": ")
         if not ENCRYPTION_ENAB:
@@ -234,7 +246,8 @@ if len(sys.argv) > 1 and sys.argv[1] == "setup":
                 f.write('  },\n')
                 f.write('  "files": {\n')
                 f.write(f'    "movefiles": "{MOVE_FILES}",\n')
-                f.write(f'    "deletesource": "{DELETE_SOURCE}"\n')
+                f.write(f'    "deletesource": "{DELETE_SOURCE}",\n')
+                f.write(f'    "maxworkers": {MAX_WORKERS}\n')
                 f.write('  },\n')
                 f.write('  "encryption": {\n')
                 f.write(f'    "enabled": "{ENCRYPTION_ENAB}",\n')
@@ -393,6 +406,11 @@ try:
             MOVETOLOC = settings["directories"].get("uploadeddir", "")
             MOVEFILES = settings["files"].get("movefiles", "false").lower() == "true"
             DELSRCFIL = settings["files"].get("deletesource", "false").lower() == "true"
+            try:
+                MAXWORKERS = max(1, int(settings["files"].get("maxworkers", settings.get("maxworkers", 4))))
+            except (ValueError, TypeError):
+                fmt.warning("settings", "Invalid maxworkers value in settings.json. Defaulting to 4.")
+                MAXWORKERS = 4
             ENCRYPTFL = settings["encryption"].get("enabled", "false").lower() == "true"
             ENCRYPKEY = settings["encryption"].get("encryptionkey", "")
             IGNOREFIL = settings.get("ignoredfiles", [])
@@ -629,17 +647,30 @@ def precreate_file(filename: str, md5json_pc_local: str) -> str:
         return "fail"
 
 
-def upload_file(local_path: str, cloud_filename: str, uploadid_local: str, md5hash: str, partseq: int = 0) -> str:
+def upload_file(
+    local_path: str,
+    cloud_filename: str,
+    uploadid_local: str,
+    md5hash: str,
+    partseq: int = 0,
+    tracker: Optional[ChunkProgressTracker] = None,
+) -> str:
     """
     Uploads a file
     :param filename: The name of the file to upload in the cloud path including the filepath.
     :param uploadid_local: The upload ID of the file.
     :param md5hash: The MD5 hash of the file/piece to upload.
     :param partseq: The part sequence of the file. Default is 0 (for single file upload).
+    :param tracker: Optional multi-worker progress tracker for parallel chunk uploads.
     :return: The MD5 hash of the file after upload. If the MD5 hash does not match, returns "mismatch". If the upload
     fails, returns "failed".
     """
+    slot = None
+    slot_released = False
     try:
+        if tracker is not None:
+            slot = tracker.acquire_slot(partseq, local_path, os.path.getsize(local_path))
+
         base_command = ["curl", "-X", "POST",
                 "-H", f"User-Agent:{USERAGENT}",
                 "-H", f"Origin:{BASEURLTB}",
@@ -653,29 +684,79 @@ def upload_file(local_path: str, cloud_filename: str, uploadid_local: str, md5ha
         if os.name == "nt":
             base_command[0] = os.path.join("curl", "bin", "curl.exe")
 
-        out = subprocess.run(base_command, stdout=subprocess.PIPE, check=True)
-        uresp = json.loads(out.stdout.decode('utf-8'))
+        if tracker is not None and slot is not None:
+            proc = subprocess.Popen(
+                base_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            buf = b""
+            if proc.stderr is not None:
+                fd = proc.stderr.fileno()
+                while True:
+                    chunk = os.read(fd, 512)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\r" in buf or b"\n" in buf:
+                        sep_r = buf.find(b"\r")
+                        sep_n = buf.find(b"\n")
+                        if sep_r == -1:
+                            sep = sep_n
+                        elif sep_n == -1:
+                            sep = sep_r
+                        else:
+                            sep = min(sep_r, sep_n)
+                        raw_line = buf[:sep]
+                        buf = buf[sep + 1:]
+                        if raw_line:
+                            tracker.update_from_curl_line(
+                                slot, raw_line.decode("utf-8", errors="replace")
+                            )
+                if buf:
+                    tracker.update_from_curl_line(slot, buf.decode("utf-8", errors="replace"))
+            stdout_bytes = proc.stdout.read() if proc.stdout is not None else b""
+            retcode = proc.wait()
+            if retcode != 0:
+                raise subprocess.CalledProcessError(retcode, base_command, output=stdout_bytes)
+            uresp = json.loads(stdout_bytes.decode("utf-8"))
+        else:
+            out = subprocess.run(base_command, stdout=subprocess.PIPE, check=True)
+            uresp = json.loads(out.stdout.decode('utf-8'))
 
         if 'error_code' not in uresp:
+            matched = uresp.get("md5") == md5hash
+            if tracker is not None and slot is not None:
+                tracker.release_slot(slot, success=matched)
+                slot_released = True
             # show a shorter, repo-relative path for readability
             try:
                 display_local = _short_path(local_path, prefer_base=SOURCE_DIR)
             except Exception:
                 display_local = os.path.basename(local_path)
             fmt.success("upload", f"File {display_local} uploaded successfully to cloud path {REMOTELOC}/{cloud_filename}.")
-            if uresp["md5"] == md5hash:
+            if matched:
                 fmt.info("md5", f"MD5 hash match for cloud file {cloud_filename} after upload.")
                 return uresp["md5"]
             fmt.error("md5", f"MD5 hash mismatch for cloud file {cloud_filename} after upload. Skipping file...")
             return "mismatch"
 
+        if tracker is not None and slot is not None:
+            tracker.release_slot(slot, success=False)
+            slot_released = True
         fmt.error("upload", "File upload failed.")
         fmt.error("upload", f"ERROR: More information: {uresp}")
         return "failed"
     except Exception as exp_upload:
+        if tracker is not None and slot is not None and not slot_released:
+            tracker.release_slot(slot, success=False)
+            slot_released = True
         fmt.error("upload", "File upload request failed.")
         fmt.error("upload", f"More information about this error: {exp_upload}")
         return "failed"
+    finally:
+        if tracker is not None and slot is not None and not slot_released:
+            tracker.release_slot(slot, success=False)
 
 
 def create_file(cloudpath_local: str, uploadid_local: str, sizebytes: int, md5json_local: str) -> requests.Response:
@@ -919,11 +1000,30 @@ def _process_single_file_entry(directory, file, remote_files):
     # Upload
     upload_failed = False
     if len(pieces) > 1:
-        for idx, pi in enumerate(pieces):
-            resp = upload_file(pi, cloud_relative, uploadid, md5dict[idx], idx)
-            if resp in ("failed", "mismatch"):
-                upload_failed = True
-                break
+        workers = min(MAXWORKERS, len(pieces))
+        fmt.info("upload", f"Uploading {len(pieces)} chunks using {workers} parallel workers...")
+        tracker = ChunkProgressTracker(fmt, workers, len(pieces), file['sizebytes'])
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_idx = {
+                    executor.submit(
+                        upload_file, pi, cloud_relative, uploadid, md5dict[idx], idx, tracker
+                    ): idx
+                    for idx, pi in enumerate(pieces)
+                }
+                for future in as_completed(future_to_idx):
+                    try:
+                        resp = future.result()
+                    except Exception as exc:
+                        fmt.error("upload", f"Chunk {future_to_idx[future]} raised an exception: {exc}")
+                        resp = "failed"
+                    if resp in ("failed", "mismatch"):
+                        upload_failed = True
+                        for pending in future_to_idx:
+                            pending.cancel()
+                        break
+        finally:
+            tracker.close()
     else:
         resp = upload_file(pieces[0], cloud_relative, uploadid, md5dict[0])
         if resp in ("failed", "mismatch"):
